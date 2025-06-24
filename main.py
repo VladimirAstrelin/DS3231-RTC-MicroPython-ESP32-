@@ -1,4 +1,4 @@
-# WORKING VERSION 25-06-2025
+# WORKING VERSION 1.0 ( 25-06-2025 )
 from machine import Pin, SoftI2C
 from time import sleep, ticks_ms, localtime, mktime
 import sys
@@ -9,6 +9,7 @@ import ntptime
 from ds3231 import DS3231
 from i2c_lcd import I2cLcd
 from sound import GORILLACELL_BUZZER, mario
+import esp32
 
 # Configuration
 I2C_ADDR = 0x27
@@ -26,6 +27,9 @@ MELODY_DUTY = 32767  # PWM duty cycle for buzzer
 
 # Pins
 BUZZER_PIN = 4  # D4
+
+# NVS Initialization
+nvs = esp32.NVS("alarm_settings")
 
 # Initialization
 try:
@@ -68,6 +72,47 @@ last_alarm_check = 0
 alarm_start_time = 0
 note_index = 0  # Track current note in melody
 last_note_time = 0  # Track time of last note played
+
+# Load alarm settings from NVS
+def load_alarm_settings():
+    global alarm_time, alarm_active
+    try:
+        alarm_hour = nvs.get_i32("alarm_hour")
+        alarm_minute = nvs.get_i32("alarm_minute")
+        alarm_enabled = nvs.get_i32("alarm_enabled")
+        if 0 <= alarm_hour <= 23 and 0 <= alarm_minute <= 59:
+            alarm_time = (alarm_hour, alarm_minute)
+            alarm_active = bool(alarm_enabled)
+            if alarm_active:
+                lcd.move_to(0, 3)
+                lcd.putstr(f"Alarm: {alarm_hour:02d}:{alarm_minute:02d}")
+                sleep(1)
+        else:
+            alarm_time = None
+            alarm_active = False
+    except Exception as e:
+        print("NVS load error:", e)
+        alarm_time = None
+        alarm_active = False
+
+# Save alarm settings to NVS
+def save_alarm_settings():
+    try:
+        if alarm_time:
+            nvs.set_i32("alarm_hour", alarm_time[0])
+            nvs.set_i32("alarm_minute", alarm_time[1])
+            nvs.set_i32("alarm_enabled", 1 if alarm_active else 0)
+            nvs.commit()
+        else:
+            nvs.set_i32("alarm_hour", 0)
+            nvs.set_i32("alarm_minute", 0)
+            nvs.set_i32("alarm_enabled", 0)
+            nvs.commit()
+    except Exception as e:
+        print("NVS save error:", e)
+        lcd.move_to(0, 3)
+        lcd.putstr("NVS Save Error")
+        sleep(1)
 
 # Encoder Button Handler
 def handle_button(pin):
@@ -276,6 +321,7 @@ def stop_alarm():
         encoder.set(max_val=1)
         current_pos = 0
         menu_offset = 0
+        save_alarm_settings()
         update_display()
         print("Alarm stopped")  # Debug output
     except Exception as e:
@@ -347,14 +393,21 @@ def handle_uart_commands():
                 if len(parts) == 2:
                     hh = int(parts[0])
                     mm = int(parts[1])
-                    alarm_time = (hh, mm)
-                    alarm_active = True
-                    lcd.move_to(0, 3)
-                    lcd.putstr(f"Alarm set: {hh:02d}:{mm:02d}")
-                    print(f"Alarm set: {hh:02d}:{mm:02d}")  # Debug output
+                    if 0 <= hh <= 23 and 0 <= mm <= 59:
+                        alarm_time = (hh, mm)
+                        alarm_active = True
+                        save_alarm_settings()
+                        lcd.move_to(0, 3)
+                        lcd.putstr(f"Alarm set: {hh:02d}:{mm:02d}")
+                        print(f"Alarm set: {hh:02d}:{mm:02d}")  # Debug output
+                    else:
+                        lcd.move_to(0, 3)
+                        lcd.putstr("Invalid Time")
+                        sleep(1)
             elif cmd == "ALARM_CLEAR":
                 stop_alarm()
                 alarm_time = None
+                save_alarm_settings()
                 lcd.move_to(0, 3)
                 lcd.putstr("Alarm cleared      ")
                 print("Alarm cleared")  # Debug output
@@ -410,6 +463,7 @@ def trigger_alarm():
 
 # Main Loop
 try:
+    load_alarm_settings()  # Load alarm settings at startup
     update_display()
     last_encoder_val = encoder.value()
     reset_buzzer()  # Ensure buzzer is silent at startup
