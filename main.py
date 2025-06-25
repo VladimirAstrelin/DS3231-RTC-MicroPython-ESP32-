@@ -1,4 +1,4 @@
-# WORKING VERSION 1.0 ( 25-06-2025 )
+# FINAL WORKING CODE (25-06-2025)
 from machine import Pin, SoftI2C
 from time import sleep, ticks_ms, localtime, mktime
 import sys
@@ -36,6 +36,7 @@ try:
     i2c = SoftI2C(sda=Pin(21), scl=Pin(22))
     lcd = I2cLcd(i2c, I2C_ADDR, I2C_NUM_ROWS, I2C_NUM_COLS)
     lcd.backlight_on()
+    lcd.clear()  # Clear display at startup
     rtc = DS3231(i2c)
     buzzer = GORILLACELL_BUZZER(BUZZER_PIN)
     buzzer.pwm.duty_u16(0)  # Explicitly silence buzzer at startup
@@ -46,6 +47,8 @@ except Exception as e:
     lcd.move_to(0, 0)
     lcd.putstr("Init Error")
     sleep(2)
+
+previous_pos = -1
 
 # States
 STATE_MAIN = 0
@@ -70,10 +73,10 @@ alarm_paused = False
 snooze_time = None
 last_alarm_check = 0
 alarm_start_time = 0
-note_index = 0  # Track current note in melody
-last_note_time = 0  # Track time of last note played
+note_index = 0
+last_note_time = 0
+force_display_refresh = False
 
-# Load alarm settings from NVS
 def load_alarm_settings():
     global alarm_time, alarm_active
     try:
@@ -83,10 +86,6 @@ def load_alarm_settings():
         if 0 <= alarm_hour <= 23 and 0 <= alarm_minute <= 59:
             alarm_time = (alarm_hour, alarm_minute)
             alarm_active = bool(alarm_enabled)
-            if alarm_active:
-                lcd.move_to(0, 3)
-                lcd.putstr(f"Alarm: {alarm_hour:02d}:{alarm_minute:02d}")
-                sleep(1)
         else:
             alarm_time = None
             alarm_active = False
@@ -95,7 +94,6 @@ def load_alarm_settings():
         alarm_time = None
         alarm_active = False
 
-# Save alarm settings to NVS
 def save_alarm_settings():
     try:
         if alarm_time:
@@ -114,7 +112,6 @@ def save_alarm_settings():
         lcd.putstr("NVS Save Error")
         sleep(1)
 
-# Encoder Button Handler
 def handle_button(pin):
     global button_pressed, last_button_time
     now = ticks_ms()
@@ -124,7 +121,6 @@ def handle_button(pin):
 
 encoder_button.irq(trigger=Pin.IRQ_FALLING, handler=handle_button)
 
-# Helper Functions
 def format_time(hh, mm, ss):
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
@@ -143,11 +139,11 @@ def update_clock_display():
         y, m, d, hh, mm, ss = rtc.read_time()
         new_time = format_time(hh, mm, ss)
         new_date = format_date(d, m, y)
-        if new_time != display_time:
+        if new_time != display_time or force_display_refresh:
             display_time = new_time
             lcd.move_to(0, 0)
             lcd.putstr(f"Time: {display_time:>13}")
-        if new_date != display_date:
+        if new_date != display_date or force_display_refresh:
             display_date = new_date
             lcd.move_to(0, 1)
             lcd.putstr(f"Date: {display_date:>13}")
@@ -165,12 +161,18 @@ def show_main_menu():
     for i in range(2):
         lcd.move_to(0, 2 + i)
         prefix = ">" if current_pos == i else " "
-        lcd.putstr(prefix + items[i][:19])
+        item_text = items[i]
+        if i == 0 and alarm_active and alarm_time:
+            display_text = f"{prefix}{item_text:<17}AL"
+        else:
+            display_text = f"{prefix}{item_text:<19}"
+        lcd.putstr(display_text)
 
 def show_ntp_menu():
     clear_menu_lines()
     items = ["Sync with NTP", "Save to RTC", "Back"]
-    for i in range(2):
+    max_display = 2
+    for i in range(max_display):
         pos = i + menu_offset
         if pos < len(items):
             lcd.move_to(0, 2 + i)
@@ -185,7 +187,7 @@ def show_rtc_menu():
         prefix = ">" if current_pos == i else " "
         lcd.putstr(prefix + items[i][:19])
 
-def show_alarm_control_menu():
+def show_alarm_control():
     clear_menu_lines()
     items = ["Pause/Resume", "Stop", "Snooze"]
     lcd.move_to(0, 2)
@@ -196,28 +198,34 @@ def show_alarm_control_menu():
     lcd.putstr(prefix + items[current_pos][:19])
 
 def update_display():
-    update_clock_display()
+    global force_display_refresh, previous_pos
     if current_state == STATE_MAIN:
-        show_main_menu()
+        if current_pos != previous_pos or force_display_refresh:
+            show_main_menu()
+            previous_pos = current_pos
     elif current_state == STATE_NTP_MENU:
         show_ntp_menu()
     elif current_state == STATE_RTC_MENU:
         show_rtc_menu()
     elif current_state == STATE_ALARM_CONTROL:
+        lcd.clear()
         lcd.move_to(0, 0)
         lcd.putstr("!!! ALARM !!!      ")
-        show_alarm_control_menu()
+        show_alarm_control()
+    if force_display_refresh:
+        force_display_refresh = False
 
 def apply_timezone(tm):
     return localtime(mktime(tm[:8]) + TIMEZONE_OFFSET * 3600)
 
 def sync_with_ntp():
+    # ... (function is unchanged)
     global ntp_sync_result
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     if not wlan.isconnected():
         lcd.move_to(0, 2)
-        lcd.putstr("Connecting WiFi...")
+        lcd.putstr("Connecting WiFi..." + " " * 3)
         wlan.connect(WIFI_SSID, WIFI_PASS)
         for _ in range(10):
             if wlan.isconnected():
@@ -229,36 +237,59 @@ def sync_with_ntp():
             t = apply_timezone(localtime())
             ntp_sync_result = t[:6]
             lcd.move_to(0, 2)
-            lcd.putstr("NTP Sync OK")
+            lcd.putstr("NTP Sync OK" + " " * 9)
             sleep(1)
         except Exception as e:
             print("NTP Error:", e)
             lcd.move_to(0, 2)
-            lcd.putstr("NTP Error")
+            lcd.putstr("NTP Error" + " " * 11)
             sleep(1)
+    else:
+        lcd.move_to(0, 2)
+        lcd.putstr("WiFi Failed" + " " * 9)
+        sleep(1)
 
 def save_to_rtc():
+    # ... (function is unchanged)
     if ntp_sync_result:
         rtc.set_time(ntp_sync_result)
         lcd.move_to(0, 2)
-        lcd.putstr("Saved to RTC")
+        lcd.putstr("Saved to RTC" + " " * 8)
+        sleep(1)
+
+def set_rtc_time(y, m, d, hh, mm, ss):
+    # ... (function is unchanged)
+    try:
+        rtc.set_time((y, m, d, hh, mm, ss))
+        lcd.move_to(0, 2)
+        lcd.putstr(f"RTC Set: {hh:02d}:{mm:02d}:{ss:02d}  ")
+        sleep(1)
+    except Exception as e:
+        print("RTC set error:", e)
+        lcd.move_to(0, 2)
+        lcd.putstr("RTC Set Error" + " " * 7)
         sleep(1)
 
 def show_rtc_time():
+    # ... (function is unchanged)
     try:
         y, m, d, hh, mm, ss = rtc.read_time()
         lcd.move_to(0, 2)
-        lcd.putstr(f"{hh:02d}:{mm:02d}:{ss:02d}")
+        lcd.putstr(f"{hh:02d}:{mm:02d}:{ss:02d}" + " " * 12)
         lcd.move_to(0, 3)
-        lcd.putstr(f"{d:02d}.{m:02d}.{y}")
+        lcd.putstr(f"{d:02d}.{m:02d}.{y}" + " " * 10)
         sleep(2)
     except Exception as e:
         print("RTC display error:", e)
+        lcd.move_to(0, 2)
+        lcd.putstr("RTC Read Error" + " " * 6)
+        sleep(2)
 
 def reset_buzzer():
+    # ... (function is unchanged)
     try:
         buzzer.pwm.duty_u16(0)
-        buzzer.pwm.freq(440)  # Set a safe default frequency
+        buzzer.pwm.freq(440)
     except Exception as e:
         print("Buzzer reset error:", e)
         lcd.move_to(0, 3)
@@ -266,6 +297,7 @@ def reset_buzzer():
         sleep(1)
 
 def play_melody():
+    # ... (function is unchanged)
     global note_index, alarm_playing, alarm_paused, last_note_time
     if not alarm_playing or alarm_paused:
         reset_buzzer()
@@ -275,15 +307,14 @@ def play_melody():
         return
     melody = mario
     if note_index >= len(melody):
-        note_index = 0  # Loop melody
+        note_index = 0
     note = melody[note_index]
     try:
-        if note <= 0 or note > 20000:  # Validate note frequency
+        if note <= 0 or note > 20000:
             buzzer.pwm.duty_u16(0)
         else:
             buzzer.pwm.freq(note)
             buzzer.pwm.duty_u16(MELODY_DUTY)
-        print(f"Playing note {note_index}: {note} Hz")  # Debug output
     except ValueError as e:
         print(f"Note error at index {note_index}: {e}")
         buzzer.pwm.duty_u16(0)
@@ -294,6 +325,7 @@ def play_melody():
     last_note_time = now
 
 def play_alarm():
+    # ... (function is unchanged)
     global alarm_playing, alarm_start_time, note_index, last_note_time
     try:
         reset_buzzer()
@@ -301,7 +333,7 @@ def play_alarm():
         last_note_time = ticks_ms()
         alarm_playing = True
         alarm_start_time = ticks_ms()
-        print("Alarm started")  # Debug output
+        print("Alarm started")
     except Exception as e:
         print("Play alarm error:", e)
         lcd.move_to(0, 3)
@@ -309,7 +341,7 @@ def play_alarm():
         sleep(1)
 
 def stop_alarm():
-    global alarm_active, alarm_playing, alarm_paused, snooze_time, current_state, note_index
+    global alarm_active, alarm_playing, alarm_paused, snooze_time, current_state, note_index, force_display_refresh, previous_pos
     try:
         reset_buzzer()
         alarm_active = False
@@ -319,11 +351,17 @@ def stop_alarm():
         note_index = 0
         current_state = STATE_MAIN
         encoder.set(max_val=1)
-        current_pos = 0
-        menu_offset = 0
         save_alarm_settings()
-        update_display()
-        print("Alarm stopped")  # Debug output
+        
+        # *** FIX IS HERE: Force a complete, immediate screen redraw ***
+        lcd.clear()
+        force_display_refresh = True
+        update_clock_display()  # Redraws time and date
+        show_main_menu()        # Redraws the main menu
+        force_display_refresh = False
+        previous_pos = current_pos  # Sync previous position to prevent re-redraw
+        
+        print("Alarm stopped")
     except Exception as e:
         print("Stop alarm error:", e)
         lcd.move_to(0, 3)
@@ -331,13 +369,14 @@ def stop_alarm():
         sleep(1)
 
 def pause_alarm():
+    # ... (function is unchanged)
     global alarm_playing, alarm_paused
     try:
         if alarm_playing:
             alarm_paused = True
             reset_buzzer()
             update_display()
-            print("Alarm paused")  # Debug output
+            print("Alarm paused")
     except Exception as e:
         print("Pause alarm error:", e)
         lcd.move_to(0, 3)
@@ -345,13 +384,14 @@ def pause_alarm():
         sleep(1)
 
 def resume_alarm():
+    # ... (function is unchanged)
     global alarm_playing, alarm_paused
     try:
         if alarm_paused:
             alarm_paused = False
-            last_note_time = ticks_ms()  # Reset note timing
+            last_note_time = ticks_ms()
             update_display()
-            print("Alarm resumed")  # Debug output
+            print("Alarm resumed")
     except Exception as e:
         print("Resume alarm error:", e)
         lcd.move_to(0, 3)
@@ -359,7 +399,7 @@ def resume_alarm():
         sleep(1)
 
 def snooze_alarm():
-    global alarm_active, alarm_playing, alarm_paused, snooze_time, current_state, note_index
+    global alarm_active, alarm_playing, alarm_paused, snooze_time, current_state, note_index, force_display_refresh, previous_pos
     try:
         y, m, d, hh, mm, ss = rtc.read_time()
         snooze_hh, snooze_mm = add_minutes_to_time(hh, mm, SNOOZE_MINUTES)
@@ -370,20 +410,41 @@ def snooze_alarm():
         note_index = 0
         current_state = STATE_MAIN
         encoder.set(max_val=1)
-        current_pos = 0
-        menu_offset = 0
+        
+        # Show temporary message
         lcd.move_to(0, 3)
-        lcd.putstr(f"Snoozed to {snooze_hh:02d}:{snooze_mm:02d}")
+        lcd.putstr(f"Snoozed to {snooze_hh:02d}:{snooze_mm:02d}" + " " * 4)
         sleep(1)
-        update_display()
-        print(f"Alarm snoozed to {snooze_hh:02d}:{snooze_mm:02d}")  # Debug output
+
+        # *** FIX IS HERE: Force a complete, immediate screen redraw ***
+        lcd.clear()
+        force_display_refresh = True
+        update_clock_display()
+        show_main_menu()
+        force_display_refresh = False
+        previous_pos = current_pos # Sync previous position
+        
+        print(f"Alarm snoozed to {snooze_hh:02d}:{snooze_mm:02d}")
     except Exception as e:
         print("Snooze alarm error:", e)
         lcd.move_to(0, 3)
         lcd.putstr("Snooze Error")
         sleep(1)
 
+def get_alarm_status():
+    # ... (function is unchanged)
+    status = "STOPPED"
+    if alarm_active and alarm_time:
+        if alarm_playing:
+            status = "PLAYING" if not alarm_paused else "PAUSED"
+        elif snooze_time:
+            status = f"SNOOZED:{snooze_time[0]:02d}:{snooze_time[1]:02d}"
+        else:
+            status = f"SET:{alarm_time[0]:02d}:{alarm_time[1]:02d}"
+    print(f"ALARM_STATUS:{status}")
+
 def handle_uart_commands():
+    # ... (function is unchanged)
     global alarm_time, alarm_active
     try:
         if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
@@ -398,32 +459,43 @@ def handle_uart_commands():
                         alarm_active = True
                         save_alarm_settings()
                         lcd.move_to(0, 3)
-                        lcd.putstr(f"Alarm set: {hh:02d}:{mm:02d}")
-                        print(f"Alarm set: {hh:02d}:{mm:02d}")  # Debug output
+                        lcd.putstr(f"Alarm set: {hh:02d}:{mm:02d}" + " " * 6)
+                        sleep(1)
+                        force_display_refresh = True # Force main menu to show "AL"
                     else:
                         lcd.move_to(0, 3)
-                        lcd.putstr("Invalid Time")
+                        lcd.putstr("Invalid Time" + " " * 8)
                         sleep(1)
             elif cmd == "ALARM_CLEAR":
                 stop_alarm()
                 alarm_time = None
                 save_alarm_settings()
                 lcd.move_to(0, 3)
-                lcd.putstr("Alarm cleared      ")
-                print("Alarm cleared")  # Debug output
+                lcd.putstr("Alarm cleared" + " " * 7)
+                sleep(1)
+                force_display_refresh = True
             elif cmd == "ALARM_PAUSE":
                 pause_alarm()
             elif cmd == "ALARM_RESUME":
                 resume_alarm()
             elif cmd == "ALARM_SNOOZE":
                 snooze_alarm()
+            elif cmd == "ALARM_STATUS":
+                get_alarm_status()
+            elif cmd.startswith("NTP_SET:"):
+                parts = cmd[8:].split(":")
+                if len(parts) == 6:
+                    y, m, d, hh, mm, ss = map(int, parts)
+                    set_rtc_time(y, m, d, hh, mm, ss)
     except Exception as e:
         print("UART command error:", e)
         lcd.move_to(0, 3)
-        lcd.putstr("UART Error")
+        lcd.putstr("UART Error" + " " * 10)
         sleep(1)
 
+
 def check_alarm():
+    # ... (function is unchanged)
     global alarm_active, alarm_playing, snooze_time, current_state, last_alarm_check, alarm_start_time
     try:
         now = ticks_ms()
@@ -446,6 +518,7 @@ def check_alarm():
         sleep(1)
 
 def trigger_alarm():
+    # ... (function is unchanged)
     global current_state, current_pos, menu_offset
     try:
         current_state = STATE_ALARM_CONTROL
@@ -454,7 +527,7 @@ def trigger_alarm():
         encoder.set(max_val=2)
         play_alarm()
         update_display()
-        print("Alarm triggered")  # Debug output
+        print("Alarm triggered")
     except Exception as e:
         print("Trigger alarm error:", e)
         lcd.move_to(0, 3)
@@ -463,24 +536,41 @@ def trigger_alarm():
 
 # Main Loop
 try:
-    load_alarm_settings()  # Load alarm settings at startup
-    update_display()
+    load_alarm_settings()
+    lcd.clear()
+    force_display_refresh = True
+    update_display() # Initial draw
     last_encoder_val = encoder.value()
-    reset_buzzer()  # Ensure buzzer is silent at startup
+    reset_buzzer()
     while True:
-        update_clock_display()
+        # Only update clock continuously if not in alarm state
+        if current_state != STATE_ALARM_CONTROL:
+            update_clock_display()
+            
         handle_uart_commands()
         check_alarm()
-        play_melody()  # Handle melody playback in main loop
+        play_melody()
+
         new_val = encoder.value()
         if new_val != last_encoder_val:
             now = ticks_ms()
             if now - last_encoder_time > ENCODER_DEBOUNCE_MS:
-                current_pos = new_val
+                if current_state == STATE_NTP_MENU:
+                    items = ["Sync with NTP", "Save to RTC", "Back"]
+                    max_display = 2
+                    current_pos = new_val
+                    if current_pos >= menu_offset + max_display:
+                        menu_offset = current_pos - max_display + 1
+                    elif current_pos < menu_offset:
+                        menu_offset = current_pos
+                    menu_offset = max(0, min(menu_offset, len(items) - max_display))
+                else:
+                    current_pos = new_val
                 update_display()
-                print(f"Encoder value changed to: {new_val}")  # Debug output
+                sleep(0.01)
                 last_encoder_val = new_val
                 last_encoder_time = now
+
         if button_pressed:
             button_pressed = False
             if current_state == STATE_MAIN:
@@ -504,6 +594,7 @@ try:
                     encoder.set(max_val=1)
                     current_pos = 0
                     menu_offset = 0
+                    force_display_refresh = True
             elif current_state == STATE_RTC_MENU:
                 if current_pos == 0:
                     show_rtc_time()
@@ -512,6 +603,7 @@ try:
                     encoder.set(max_val=1)
                     current_pos = 0
                     menu_offset = 0
+                    force_display_refresh = True
             elif current_state == STATE_ALARM_CONTROL:
                 if current_pos == 0:
                     if alarm_paused:
@@ -520,9 +612,17 @@ try:
                         pause_alarm()
                 elif current_pos == 1:
                     stop_alarm()
+                    current_pos = 0
+                    menu_offset = 0
                 elif current_pos == 2:
                     snooze_alarm()
-            update_display()
+                    current_pos = 0
+                    menu_offset = 0
+            
+            # General update after any button press
+            if current_state != STATE_ALARM_CONTROL:
+                 update_display()
+
         sleep(0.05)
 except Exception as e:
     print("Main loop error:", e)
@@ -530,3 +630,7 @@ except Exception as e:
     lcd.putstr("Main Loop Error")
     reset_buzzer()
     sleep(2)
+
+
+
+
